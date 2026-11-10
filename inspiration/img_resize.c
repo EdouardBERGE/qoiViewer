@@ -165,7 +165,9 @@ unsigned int *img_resize(const unsigned int *buffer, int width, int height, int 
 	applyVerticalSharpen(cur,cw,ch);
 	w=13;
     }
-    unsigned int *out = bilinear(cur, cw, ch, width, height, fx, fy, ow, oh);
+    /* aucune reduction par 2 (agrandissement ou reduction < 50%) : cur est reste NULL */
+    unsigned int *out = bilinear(cur ? cur : buffer, cw, ch, width, height, fx, fy, ow, oh);
+    if (!out) { free(owned); return NULL; }
     if (!w) {
 	    // no post-reduction sharpen
 	    int ratio;

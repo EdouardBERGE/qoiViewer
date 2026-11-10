@@ -2,24 +2,44 @@
  * qoiviewer - visionneuse d'images QOI (SDL3)
  *
  * Liste les fichiers *.qoi (casse ignoree) du repertoire courant, affiche le premier.
- *   Fleches gauche/haut  : image precedente     Fleches droite/bas : image suivante
- *   ALT+ENTER            : bascule plein ecran  ESC                : quitter
+ * Touches : voir help_lines[] (H pour l'afficher).
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
 #include <SDL3/SDL.h>
 
 #include "qoi.h"
 #include "img_resize.h"
+#include "text.h"
 
 #define REPEAT_DELAY    300   /* ms avant le debut de la repetition */
 #define REPEAT_INTERVAL 300   /* ms entre deux repetitions          */
+#define MIN_WIN         200   /* taille minimale de la fenetre (largeur et hauteur) */
+#define ZOOM_STEP       1.25
+#define ZOOM_MAX        32.0
 #define CHECKER_SIZE    8     /* damier de fond pour la transparence */
 #define CHECKER_A       0xFF666666u
 #define CHECKER_B       0xFF999999u
 #define BACKGROUND      0xFF000000u
+#define HELP_BG         0xD0202020u
+
+static const char *help_lines[] = {
+	"qoiviewer - aide",
+	"",
+	"Fleche gauche/haut   image precedente",
+	"Fleche droite/bas    image suivante",
+	"Pave num. +          zoom avant",
+	"Pave num. -          zoom arriere",
+	"Pave num. *          zoom ajuste",
+	"K                    zoom 100% (1:1)",
+	"ALT+ENTREE           plein ecran",
+	"H                    afficher/masquer l'aide",
+	"ESC                  fermer l'aide / quitter",
+};
+#define HELP_NLINES ((int)(sizeof help_lines / sizeof *help_lines))
 
 typedef struct {
 	unsigned int *pixels;   /* ARGB 0xAARRGGBB premultiplie */
@@ -28,15 +48,23 @@ typedef struct {
 	int error;
 } Image;
 
+typedef enum { ACT_NONE, ACT_PREV, ACT_NEXT, ACT_ZOOM_IN, ACT_ZOOM_OUT } Action;
+
 typedef struct {
 	SDL_Window  *win;
 	char       **files;
 	int          nfiles;
 	int          current;
 	int          fullscreen;
+	int          help;
+	int          zoom_auto;  /* 1 : ajuste a la fenetre/l'ecran ; 0 : zoom manuel */
+	double       zoom;       /* zoom manuel */
+	uint32_t    *font;
 	Image        img;
-	SDL_Surface *view;      /* image mise a l'echelle et composee, prete a blitter */
-	int          view_bw, view_bh; /* boite cible ayant servi a construire view */
+	/* vue : partie visible de l'image mise a l'echelle, composee, prete a blitter */
+	SDL_Surface *view;
+	int          view_x, view_y;            /* position dans la fenetre (peut etre < 0) */
+	int          key_sw, key_sh, key_vw, key_vh;
 } Viewer;
 
 /* ------------------------------------------------------------------------- */
@@ -132,10 +160,10 @@ static void load_image(Image *img, const char *path)
 /* Geometrie                                                                 */
 /* ------------------------------------------------------------------------- */
 
-/* Taille d'affichage de l'image dans une boite bw x bh : reduction seulement, ratio conserve. */
-static void fit_size(int w, int h, int bw, int bh, int *ow, int *oh)
+/* Taille de l'image ajustee dans une boite bw x bh, ratio conserve. allow_up : agrandir si plus petite. */
+static void fit_size(int w, int h, int bw, int bh, int allow_up, int *ow, int *oh)
 {
-	if (w <= bw && h <= bh) { *ow = w; *oh = h; return; }
+	if (!allow_up && w <= bw && h <= bh) { *ow = w; *oh = h; return; }
 	if ((long long)w * bh > (long long)h * bw) {
 		*ow = bw;
 		*oh = (int)(((long long)h * bw + w / 2) / w);
@@ -161,32 +189,102 @@ static void windowed_box(Viewer *v, SDL_Rect *usable, int *bw, int *bh)
 	}
 	*bw = usable->w - left - right;
 	*bh = usable->h - top - bottom;
-	if (*bw < 64) *bw = 64;
-	if (*bh < 64) *bh = 64;
+	if (*bw < MIN_WIN) *bw = MIN_WIN;
+	if (*bh < MIN_WIN) *bh = MIN_WIN;
+}
+
+/* Taille de l'image entiere une fois mise a l'echelle. bw x bh : boite d'ajustement (zoom auto). */
+static void scaled_size(Viewer *v, int bw, int bh, int *sw, int *sh)
+{
+	if (v->zoom_auto) {
+		fit_size(v->img.w, v->img.h, bw, bh, v->fullscreen, sw, sh);
+		return;
+	}
+	*sw = (int)lround(v->img.w * v->zoom);
+	*sh = (int)lround(v->img.h * v->zoom);
+	if (*sw < 1) *sw = 1;
+	if (*sh < 1) *sh = 1;
+}
+
+/* Boite d'ajustement pour le mode courant, viewport = taille actuelle de la surface fenetre. */
+static void current_box(Viewer *v, int vw, int vh, int *bw, int *bh)
+{
+	SDL_Rect usable;
+	if (v->fullscreen) { *bw = vw; *bh = vh; }
+	else windowed_box(v, &usable, bw, bh);
+}
+
+static double effective_zoom(Viewer *v)
+{
+	SDL_Surface *screen = SDL_GetWindowSurface(v->win);
+	int bw, bh, sw, sh;
+	current_box(v, screen ? screen->w : MIN_WIN, screen ? screen->h : MIN_WIN, &bw, &bh);
+	scaled_size(v, bw, bh, &sw, &sh);
+	return (double)sw / v->img.w;
 }
 
 /* ------------------------------------------------------------------------- */
-/* Construction de la vue (mise a l'echelle + composition sur damier)        */
+/* Construction de la vue                                                    */
 /* ------------------------------------------------------------------------- */
-static void build_view(Viewer *v, int bw, int bh)
-{
-	int ow, oh;
-	unsigned int *scaled;
 
-	if (v->view && v->view_bw == bw && v->view_bh == bh) return;
+/* Pour un axe : image de longueur len, mise a l'echelle a s, vue de longueur vlen, centree.
+   Donne la tranche source utile [src0, src1[, sa longueur une fois mise a l'echelle (out)
+   et sa position dans la vue (dst, negative si l'image deborde : le blit clippe). */
+static void axis_crop(int len, int s, int vlen, int *src0, int *src1, int *out, int *dst)
+{
+	if (s <= vlen) {
+		*src0 = 0; *src1 = len; *out = s; *dst = (vlen - s) / 2;
+		return;
+	}
+	const double z = (double)s / len;
+	const int o = (s - vlen) / 2;                 /* debut de la zone visible, en coordonnees mises a l'echelle */
+	*src0 = (int)floor(o / z) - 2;                /* marge de 2 pixels : bords du bilineaire hors champ */
+	*src1 = (int)ceil((o + vlen) / z) + 2;
+	if (*src0 < 0) *src0 = 0;
+	if (*src1 > len) *src1 = len;
+	*out = (int)lround((*src1 - *src0) * z);
+	if (*out < 1) *out = 1;
+	*dst = (int)lround(*src0 * z) - o;
+}
+
+static void build_view(Viewer *v, int vw, int vh)
+{
+	int bw, bh, sw, sh, x0, x1, y0, y1, ow, oh, dx, dy;
+	unsigned int *crop, *scaled;
+
+	current_box(v, vw, vh, &bw, &bh);
+	scaled_size(v, bw, bh, &sw, &sh);
+	if (v->view && v->key_sw == sw && v->key_sh == sh && v->key_vw == vw && v->key_vh == vh) return;
 	SDL_DestroySurface(v->view);
 	v->view = NULL;
+	v->key_sw = sw; v->key_sh = sh; v->key_vw = vw; v->key_vh = vh;
 
-	fit_size(v->img.w, v->img.h, bw, bh, &ow, &oh);
-	if (ow == v->img.w && oh == v->img.h) {
-		scaled = v->img.pixels;
-	} else if (!(scaled = img_resize(v->img.pixels, v->img.w, v->img.h, ow, oh))) {
-		fprintf(stderr, "Echec du redimensionnement %dx%d -> %dx%d\n", v->img.w, v->img.h, ow, oh);
-		scaled = v->img.pixels; ow = v->img.w; oh = v->img.h;
+	axis_crop(v->img.w, sw, vw, &x0, &x1, &ow, &dx);
+	axis_crop(v->img.h, sh, vh, &y0, &y1, &oh, &dy);
+	const int cw = x1 - x0, ch = y1 - y0;
+
+	/* tranche source */
+	if (cw == v->img.w && ch == v->img.h) {
+		crop = v->img.pixels;
+	} else {
+		crop = malloc((size_t)cw * ch * sizeof *crop);
+		if (!crop) return;
+		for (int y = 0; y < ch; y++)
+			memcpy(crop + (size_t)y * cw, v->img.pixels + (size_t)(y0 + y) * v->img.w + x0, cw * sizeof *crop);
+	}
+	/* mise a l'echelle */
+	if (ow == cw && oh == ch) {
+		scaled = crop;
+	} else if (!(scaled = img_resize(crop, cw, ch, ow, oh))) {
+		fprintf(stderr, "Echec du redimensionnement %dx%d -> %dx%d\n", cw, ch, ow, oh);
+		scaled = crop; ow = cw; oh = ch;
 	}
 
 	v->view = SDL_CreateSurface(ow, oh, SDL_PIXELFORMAT_ARGB8888);
+	v->view_x = dx;
+	v->view_y = dy;
 	if (v->view) {
+		SDL_SetSurfaceBlendMode(v->view, SDL_BLENDMODE_NONE);
 		SDL_LockSurface(v->view);
 		for (int y = 0; y < oh; y++) {
 			unsigned int *dst = (unsigned int *)((Uint8 *)v->view->pixels + (size_t)y * v->view->pitch);
@@ -195,9 +293,12 @@ static void build_view(Viewer *v, int bw, int bh)
 				memcpy(dst, src, ow * sizeof *dst);
 				continue;
 			}
+			/* composition "over" (premultiplie) sur un damier fixe par rapport a la fenetre */
+			const int sy = y + dy + vh; /* + vh : reste positif */
 			for (int x = 0; x < ow; x++) {
-				const unsigned int p = src[x], a = p >> 24, ia = 255 - a;
-				const unsigned int bg = ((x / CHECKER_SIZE + y / CHECKER_SIZE) & 1) ? CHECKER_A : CHECKER_B;
+				const unsigned int p = src[x], ia = 255 - (p >> 24);
+				const int sx = x + dx + vw;
+				const unsigned int bg = ((sx / CHECKER_SIZE + sy / CHECKER_SIZE) & 1) ? CHECKER_A : CHECKER_B;
 				unsigned int out = 0xFF000000u;
 				for (int s = 0; s < 24; s += 8) {
 					unsigned int c = ((p >> s) & 255) + (((bg >> s) & 255) * ia + 127) / 255;
@@ -208,30 +309,71 @@ static void build_view(Viewer *v, int bw, int bh)
 		}
 		SDL_UnlockSurface(v->view);
 	}
-	if (scaled != v->img.pixels) free(scaled);
-	v->view_bw = bw;
-	v->view_bh = bh;
+	if (scaled != crop) free(scaled);
+	if (crop != v->img.pixels) free(crop);
 }
 
 /* ------------------------------------------------------------------------- */
 /* Affichage                                                                 */
 /* ------------------------------------------------------------------------- */
+#define HELP_MARGIN 8
+
+static int help_maxlen(void)
+{
+	int maxlen = 0;
+	for (int i = 0; i < HELP_NLINES; i++) {
+		int l = (int)strlen(help_lines[i]);
+		if (l > maxlen) maxlen = l;
+	}
+	return maxlen;
+}
+
+/* Taille du panneau d'aide pour une hauteur de caractere ch. */
+static void help_size(int ch, int *pw, int *ph)
+{
+	*pw = (ch * FONT_W + FONT_H / 2) / FONT_H * help_maxlen() + 2 * HELP_MARGIN;
+	*ph = ch * HELP_NLINES + 2 * HELP_MARGIN;
+}
+
+static void draw_help(Viewer *v, SDL_Surface *screen)
+{
+	const int maxlen = help_maxlen(), margin = HELP_MARGIN;
+	int pw, ph;
+	/* hauteur de caractere : 24 au plus, reduite pour tenir dans la fenetre (largeur = hauteur / 2) */
+	int ch = FONT_H;
+	if ((ch / 2) * maxlen > screen->w - 4 * margin) ch = 2 * ((screen->w - 4 * margin) / maxlen);
+	if (ch * HELP_NLINES > screen->h - 4 * margin) ch = (screen->h - 4 * margin) / HELP_NLINES;
+	if (ch < 6) ch = 6;
+
+	help_size(ch, &pw, &ph);
+	uint32_t *buf = malloc((size_t)pw * ph * sizeof *buf);
+	if (!buf) return;
+	for (int i = 0; i < pw * ph; i++) buf[i] = HELP_BG;
+	for (int i = 0; i < HELP_NLINES; i++)
+		draw_text_ss3x3(buf, pw, ph, margin, margin + i * ch, ch, v->font, "%s", help_lines[i]);
+
+	SDL_Surface *panel = SDL_CreateSurfaceFrom(pw, ph, SDL_PIXELFORMAT_ARGB8888, buf, pw * (int)sizeof *buf);
+	if (panel) {
+		SDL_Rect r = { (screen->w - pw) / 2, (screen->h - ph) / 2, pw, ph };
+		SDL_SetSurfaceBlendMode(panel, SDL_BLENDMODE_BLEND);
+		SDL_BlitSurface(panel, NULL, screen, &r);
+		SDL_DestroySurface(panel);
+	}
+	free(buf);
+}
+
 static void render(Viewer *v)
 {
 	SDL_Surface *screen = SDL_GetWindowSurface(v->win);
-	int bw, bh;
-	SDL_Rect usable;
-
 	if (!screen) return;
-	if (v->fullscreen) { bw = screen->w; bh = screen->h; }
-	else windowed_box(v, &usable, &bw, &bh);
-	build_view(v, bw, bh);
 
+	build_view(v, screen->w, screen->h);
 	SDL_FillSurfaceRect(screen, NULL, BACKGROUND);
 	if (v->view) {
-		SDL_Rect r = { (screen->w - v->view->w) / 2, (screen->h - v->view->h) / 2, v->view->w, v->view->h };
-		SDL_BlitSurface(v->view, NULL, screen, &r);
+		SDL_Rect r = { v->view_x, v->view_y, v->view->w, v->view->h };
+		SDL_BlitSurface(v->view, NULL, screen, &r); /* clipping par SDL si l'image deborde */
 	}
+	if (v->help && v->font) draw_help(v, screen);
 	SDL_UpdateWindowSurface(v->win);
 }
 
@@ -239,35 +381,50 @@ static void update_title(Viewer *v)
 {
 	char title[1024];
 	const char *name = v->files[v->current];
+	const int zoom = (int)lround(100.0 * effective_zoom(v));
+
 	if (v->img.error)
-		snprintf(title, sizeof title, "%s [%d/%d] - ERREUR DE DECODAGE", name, v->current + 1, v->nfiles);
-	else if (v->view && (v->view->w != v->img.w || v->view->h != v->img.h))
-		snprintf(title, sizeof title, "%s [%d/%d] - %dx%d (%d%%)", name, v->current + 1, v->nfiles,
-		         v->img.w, v->img.h, (int)((100LL * v->view->w + v->img.w / 2) / v->img.w));
+		snprintf(title, sizeof title, "%s - ERREUR DE DECODAGE [%d/%d]", name, v->current + 1, v->nfiles);
+	else if (zoom != 100)
+		snprintf(title, sizeof title, "%s - %dx%d - %d%% [%d/%d]", name, v->img.w, v->img.h, zoom,
+		         v->current + 1, v->nfiles);
 	else
-		snprintf(title, sizeof title, "%s [%d/%d] - %dx%d", name, v->current + 1, v->nfiles, v->img.w, v->img.h);
+		snprintf(title, sizeof title, "%s - %dx%d [%d/%d]", name, v->img.w, v->img.h, v->current + 1, v->nfiles);
 	SDL_SetWindowTitle(v->win, title);
 }
 
-/* Ajuste la fenetre a la vue courante et la garde dans la zone utilisable de l'ecran. */
+/* Fenetre fenetree : taille de l'image mise a l'echelle, bornee a [MIN_WIN, ecran],
+   et gardee dans la zone utilisable de l'ecran. */
 static void fit_window(Viewer *v)
 {
 	SDL_Rect usable;
-	int bw, bh, x, y, top = 0, left = 0, bottom = 0, right = 0;
+	int bw, bh, sw, sh, x, y, top = 0, left = 0, bottom = 0, right = 0;
 
 	if (v->fullscreen) return;
 	windowed_box(v, &usable, &bw, &bh);
-	build_view(v, bw, bh);
-	if (!v->view) return;
+	scaled_size(v, bw, bh, &sw, &sh);
+	int ww = sw < MIN_WIN ? MIN_WIN : sw;
+	int wh = sh < MIN_WIN ? MIN_WIN : sh;
+	if (v->help) { /* aide affichee : la fenetre s'agrandit pour la montrer en taille normale */
+		int pw, ph;
+		help_size(FONT_H, &pw, &ph);
+		if (ww < pw + 4 * HELP_MARGIN) ww = pw + 4 * HELP_MARGIN;
+		if (wh < ph + 4 * HELP_MARGIN) wh = ph + 4 * HELP_MARGIN;
+	}
+	if (ww > bw) ww = bw;
+	if (wh > bh) wh = bh;
 
-	SDL_SetWindowSize(v->win, v->view->w, v->view->h);
+	int cw, chh;
+	SDL_GetWindowSize(v->win, &cw, &chh);
+	if (cw == ww && chh == wh) return;
+	SDL_SetWindowSize(v->win, ww, wh);
 	SDL_SyncWindow(v->win);
 
 	SDL_GetWindowBordersSize(v->win, &top, &left, &bottom, &right);
 	SDL_GetWindowPosition(v->win, &x, &y);
 	const int nx0 = x, ny0 = y;
-	if (x + v->view->w + right > usable.x + usable.w) x = usable.x + usable.w - v->view->w - right;
-	if (y + v->view->h + bottom > usable.y + usable.h) y = usable.y + usable.h - v->view->h - bottom;
+	if (x + ww + right > usable.x + usable.w) x = usable.x + usable.w - ww - right;
+	if (y + wh + bottom > usable.y + usable.h) y = usable.y + usable.h - wh - bottom;
 	if (x - left < usable.x) x = usable.x + left;
 	if (y - top < usable.y) y = usable.y + top;
 	if (x != nx0 || y != ny0) {
@@ -276,15 +433,41 @@ static void fit_window(Viewer *v)
 	}
 }
 
+static void refresh(Viewer *v)
+{
+	fit_window(v);
+	render(v);
+	update_title(v);
+}
+
 static void show(Viewer *v, int index)
 {
 	v->current = (index % v->nfiles + v->nfiles) % v->nfiles;
 	load_image(&v->img, v->files[v->current]);
 	SDL_DestroySurface(v->view);
 	v->view = NULL;
-	fit_window(v);
-	render(v);
-	update_title(v);
+	v->zoom_auto = 1;
+	refresh(v);
+}
+
+static void set_zoom(Viewer *v, double z)
+{
+	const int m = v->img.w < v->img.h ? v->img.w : v->img.h;
+	const double zmin = 1.0 / m;            /* au moins 1 pixel sur le plus petit cote */
+	if (z < zmin) z = zmin;
+	if (z > ZOOM_MAX) z = ZOOM_MAX;
+	v->zoom_auto = 0;
+	v->zoom = z;
+	refresh(v);
+}
+
+static void zoom_step(Viewer *v, int dir)
+{
+	const double cur = v->zoom_auto ? effective_zoom(v) : v->zoom;
+	double z = dir > 0 ? cur * ZOOM_STEP : cur / ZOOM_STEP;
+	/* on ne saute pas par-dessus 100% */
+	if ((cur < 0.999 && z > 1.001) || (cur > 1.001 && z < 0.999)) z = 1.0;
+	set_zoom(v, z);
 }
 
 static void toggle_fullscreen(Viewer *v)
@@ -296,30 +479,45 @@ static void toggle_fullscreen(Viewer *v)
 		return;
 	}
 	SDL_SyncWindow(v->win);
-	if (!v->fullscreen) fit_window(v);
-	render(v);
-	update_title(v);
+	v->zoom_auto = 1;
+	refresh(v);
 }
 
-/* ------------------------------------------------------------------------- */
-static int nav_dir(SDL_Scancode sc)
+static void do_action(Viewer *v, Action a)
 {
-	switch (sc) {
-		case SDL_SCANCODE_LEFT:  case SDL_SCANCODE_UP:   return -1;
-		case SDL_SCANCODE_RIGHT: case SDL_SCANCODE_DOWN: return  1;
-		default: return 0;
+	switch (a) {
+		case ACT_PREV:     show(v, v->current - 1); break;
+		case ACT_NEXT:     show(v, v->current + 1); break;
+		case ACT_ZOOM_IN:  zoom_step(v, 1);  break;
+		case ACT_ZOOM_OUT: zoom_step(v, -1); break;
+		default: break;
 	}
 }
 
+/* Actions repetables (touche maintenue). */
+static Action key_action(const SDL_KeyboardEvent *k)
+{
+	switch (k->scancode) {
+		case SDL_SCANCODE_LEFT:  case SDL_SCANCODE_UP:   return ACT_PREV;
+		case SDL_SCANCODE_RIGHT: case SDL_SCANCODE_DOWN: return ACT_NEXT;
+		case SDL_SCANCODE_KP_PLUS:  return ACT_ZOOM_IN;
+		case SDL_SCANCODE_KP_MINUS: return ACT_ZOOM_OUT;
+		default: return ACT_NONE;
+	}
+}
+
+/* ------------------------------------------------------------------------- */
 int main(int argc, char **argv)
 {
 	Viewer v;
 	SDL_Scancode held = SDL_SCANCODE_UNKNOWN;
+	Action held_action = ACT_NONE;
 	Uint64 next_repeat = 0;
 	int running = 1;
 
 	(void)argc; (void)argv;
 	memset(&v, 0, sizeof v);
+	v.zoom_auto = 1;
 
 	if (!SDL_Init(SDL_INIT_VIDEO)) {
 		fprintf(stderr, "SDL_Init error [%s]\n", SDL_GetError());
@@ -330,11 +528,12 @@ int main(int argc, char **argv)
 		SDL_Quit();
 		return 1;
 	}
-	if (!(v.win = SDL_CreateWindow("qoiviewer", 320, 200, 0))) {
+	if (!(v.win = SDL_CreateWindow("qoiviewer", MIN_WIN, MIN_WIN, 0))) {
 		fprintf(stderr, "SDL_CreateWindow error [%s]\n", SDL_GetError());
 		SDL_Quit();
 		return 1;
 	}
+	v.font = font_build();
 	show(&v, 0);
 
 	while (running) {
@@ -351,19 +550,31 @@ int main(int argc, char **argv)
 				case SDL_EVENT_QUIT:
 					running = 0;
 					break;
-				case SDL_EVENT_KEY_DOWN:
+				case SDL_EVENT_KEY_DOWN: {
+					Action a;
 					if (ev.key.repeat) break; /* repetition geree par nos soins */
 					if (ev.key.scancode == SDL_SCANCODE_ESCAPE) {
-						running = 0;
+						if (v.help) { v.help = 0; refresh(&v); }
+						else running = 0;
 					} else if ((ev.key.scancode == SDL_SCANCODE_RETURN || ev.key.scancode == SDL_SCANCODE_KP_ENTER)
 					           && (ev.key.mod & SDL_KMOD_ALT)) {
 						toggle_fullscreen(&v);
-					} else if (nav_dir(ev.key.scancode)) {
+					} else if (ev.key.key == SDLK_K) {
+						set_zoom(&v, 1.0);
+					} else if (ev.key.scancode == SDL_SCANCODE_KP_MULTIPLY) {
+						v.zoom_auto = 1;
+						refresh(&v);
+					} else if (ev.key.key == SDLK_H) {
+						v.help = !v.help;
+						refresh(&v);
+					} else if ((a = key_action(&ev.key)) != ACT_NONE) {
 						held = ev.key.scancode;
-						show(&v, v.current + nav_dir(held));
+						held_action = a;
+						do_action(&v, a);
 						next_repeat = SDL_GetTicks() + REPEAT_DELAY;
 					}
 					break;
+				}
 				case SDL_EVENT_KEY_UP:
 					if (ev.key.scancode == held) held = SDL_SCANCODE_UNKNOWN;
 					break;
@@ -383,14 +594,15 @@ int main(int argc, char **argv)
 		}
 
 		if (held != SDL_SCANCODE_UNKNOWN && SDL_GetTicks() >= next_repeat) {
-			show(&v, v.current + nav_dir(held));
-			/* compte a partir de la fin du chargement : pas d'accumulation sur les grosses images */
+			do_action(&v, held_action);
+			/* compte a partir de la fin du traitement : pas d'accumulation sur les grosses images */
 			next_repeat = SDL_GetTicks() + REPEAT_INTERVAL;
 		}
 	}
 
 	free_image(&v.img);
 	SDL_DestroySurface(v.view);
+	free(v.font);
 	for (int i = 0; i < v.nfiles; i++) free(v.files[i]);
 	free(v.files);
 	SDL_DestroyWindow(v.win);

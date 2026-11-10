@@ -6,7 +6,7 @@ SDL_CFLAGS := $(shell pkg-config --cflags sdl3)
 SDL_LIBS   := $(shell pkg-config --libs sdl3)
 
 TARGET := qoiviewer
-SRCS   := main.c qoi.c img_resize.c img_sharpen.c
+SRCS   := main.c qoi.c img_resize.c img_sharpen.c text.c font.c
 OBJS   := $(SRCS:.c=.o)
 
 .PHONY: all clean install uninstall
