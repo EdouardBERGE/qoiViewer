@@ -16,7 +16,8 @@
 #include "text.h"
 
 #define REPEAT_DELAY    300   /* ms avant le debut de la repetition */
-#define REPEAT_INTERVAL 300   /* ms entre deux repetitions          */
+#define REPEAT_NAV      40    /* ms entre deux repetitions en navigation (25 images/s) */
+#define REPEAT_ZOOM     300   /* ms entre deux repetitions du zoom  */
 #define MIN_WIN         200   /* taille minimale de la fenetre (largeur et hauteur) */
 #define ZOOM_STEP       1.25
 #define ZOOM_MAX        32.0
@@ -595,8 +596,11 @@ int main(int argc, char **argv)
 
 		if (held != SDL_SCANCODE_UNKNOWN && SDL_GetTicks() >= next_repeat) {
 			do_action(&v, held_action);
-			/* compte a partir de la fin du traitement : pas d'accumulation sur les grosses images */
-			next_repeat = SDL_GetTicks() + REPEAT_INTERVAL;
+			/* cadence fixe (25 images/s en navigation) ; si le chargement est plus lent que
+			   l'intervalle, on enchaine sans accumuler de retard */
+			const Uint64 now = SDL_GetTicks();
+			next_repeat += (held_action == ACT_PREV || held_action == ACT_NEXT) ? REPEAT_NAV : REPEAT_ZOOM;
+			if (next_repeat < now) next_repeat = now;
 		}
 	}
 
